@@ -84,11 +84,6 @@ int main(int argc, char ** argv) {
          }
          updateSocketSets(&readfds, master_fd);
     } */
-
-    //3.Start the game while the num of hops is > 0
-        //-select a random player socket to pass the potato to
-                //generate random number using rand(): seeding the generator: srand((unsigned int)time(NULL)+player_id); getting the rand number: int random = rand() % N;
-                //connect to the IP address of the player socket (i.e player.sock_addr)
     return EXIT_SUCCESS;
     
 }
