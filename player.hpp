@@ -25,20 +25,19 @@ class Player {
     public:
         Player * next;
         Player * prev;
-
+        Player() : player_id(-1), socket(-1), player_host(NULL), player_port(NULL), next(NULL), prev(NULL) {};
         Player(int id, int sock_fd, char * host): player_id(id), socket(sock_fd), player_host(host), player_port(NULL), next(NULL), prev(NULL) {};
-        int getPlayerId() { return player_id; }
+        int & getPlayerId() { return player_id; }
 
-        int getSocket() { return socket; }
+        int & getSocket() { return socket; }
 
-        char * getHost() { return player_host;}
+        char ** getHost() { return &player_host;}
 
-        char * getPort() { return player_port;}
+        char ** getPort() { return &player_port;}
 
-        void setHost(char * host) { player_host = host;}
-
-        void setPort(char * port) { player_port = port;}
-
+        /*
+         * Player data format: <player_id>:<player_host>:<player_port>&
+         */
         char * getPlayerData() {
             const char * id = std::to_string(player_id).c_str();
             char data[100];
@@ -50,7 +49,9 @@ class Player {
             data[index] = ':';
             index++;
             copyToBuffer(data, player_port, &index);
-            data[index] = 0;
+            data[index] = '&';  //extra character to mark end of player data
+            index++;
+            data[index]= 0;
             return strdup(data);
         }
         

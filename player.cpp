@@ -1,6 +1,7 @@
 #include <vector>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <cassert>
 
 #include "player.hpp"
 #include "utils.hpp"
@@ -11,71 +12,117 @@ using std::string;
 
 fd_set readfds;
 fd_set writefds;
+int player_id;
+int num_players;
+
 int player_sock;
 int ringmaster_sock;
+
 int max_fd;
 int curr_sockfd;
-string player_port;
-vector<int> neighbours[3];
+int player_port;
+Player * right_neighbor = new Player();
+Player * left_neighbor = new Player();
+vector<int> neighbours_fds[2];
+bool isConnected = false;
+bool isGameOver = false;
+
+/*
+ * Neighbour connection startegy:
+ * Right neighbor: use getaddrinfo() with the host and port of the player process to get right neighbour socket
+ * Left neighbor: listen for connection on player_sock and accept() to open new socket connection for left neighbor
+ */
+
+
+void printSocketList() {
+    for (int i = 0; i < neighbours_fds->size(); i++) {
+        int fd = neighbours_fds->at(i);
+        std::cout << "fd at " <<  i << " = " << fd << std::endl;
+    }
+}
+
+/*
+ * Creates a client socket to connect with a server process
+ */
+int getClientSocket(int protocol) {
+    return socket(AF_INET, SOCK_STREAM, protocol);
+}
+
+/*
+ * Parses neighbour data to set Player fields
+ * i.e <player_id>:<player_host>:<player_port>&
+ */
+void setNeighbourFields(char * data, Player * neighbour) {
+    vector<string> neighbour_fields = parse(data, ":");
+    if (neighbour_fields.size() != 3) {
+        std::cerr << "Error: invalid neighbour data\n";
+        exit(EXIT_FAILURE);
+    } 
+    neighbour->getPlayerId() = atoi(neighbour_fields.at(0).c_str());
+    *(neighbour->getHost()) = strdup(neighbour_fields.at(1).c_str());
+    *(neighbour->getPort()) = strdup(neighbour_fields.at(2).c_str());
+}
+
+/*
+ * Parses intial setup data received from ringmaster 
+ * i.e <num of players>&<player id>&<right neighbour data>&<left neighbour data>&
+ */
+void parseInitData(char * data) {
+    if (strlen(data) == 0) {
+        return;
+    }
+    vector<string> neighbour_tokens = parse(data, "&");
+    if (neighbour_tokens.size() >= 4) {
+        num_players = atoi(neighbour_tokens.at(0).c_str());
+        player_id = atoi(neighbour_tokens.at(1).c_str());
+        setNeighbourFields(strdup(neighbour_tokens.at(2).c_str()), right_neighbor);
+        setNeighbourFields(strdup(neighbour_tokens.at(3).c_str()), left_neighbor);
+    }
+}
 
 
 /*
- * Accepts a new connection and adds the connection socket to the list
+ * Accepts a new connection from the left neighbour and adds the connection socket to the list
  */
 void handleNewConnection() {
     struct sockaddr neighbor_addr;
     socklen_t sz = sizeof(neighbor_addr);
 
-    int conn = accept(player_sock, &neighbor_addr, &sz);
-    if (conn == -1) {
-        if (neighbours->size() == 3) {
+    int left_sock = accept(player_sock, &neighbor_addr, &sz);
+    if (left_sock == -1) {
+        if (neighbours_fds->size() == 2) {
             perror("Error: max number of players reached");
         } else {
             perror("Error: cannot accept new player");
         }
         exit(EXIT_FAILURE);
     }
-    neighbours->push_back(conn);
-    max_fd = std::max(max_fd, conn);
+   
+    left_neighbor->getSocket() = left_sock;
+    neighbours_fds->push_back(left_sock);
+    max_fd = std::max(max_fd, left_sock);
+    curr_sockfd = left_sock;
 }
 
 /*
- * Generates a unique port for each player
+ * Connects the player to another process with the specified host name and port
  */
-void setPlayerPort() {
-    srand((unsigned int)time(NULL));
-    int port_num = rand() % 8000 + 1001;
-    player_port = std::to_string(port_num);
-}
+void connectToProcess(const char * host_name, const char * host_port, int * client_fd) {
+    struct addrinfo hostaddr;
+    struct addrinfo *hostaddr_list;
 
-/*
- * Creates a socket to connect with the ringmaster
- */
-int getRingMasterSocket(int protocol) {
-    return socket(AF_INET, SOCK_STREAM, protocol);
-}
+    memset(&hostaddr, 0, sizeof(hostaddr));
+    hostaddr.ai_family = AF_INET;
+    hostaddr.ai_socktype = SOCK_STREAM;
 
-/*
- * Connects the player to the ringmaster process
- */
-void connectToRingmaster(const char * master_name, const char * master_port) {
-    struct addrinfo masteraddr;
-    struct addrinfo *masteraddr_list;
+    int status = getaddrinfo(host_name, host_port, &hostaddr, &hostaddr_list);
+    errorListener("Error connecting to process", status);
 
-    memset(&masteraddr, 0, sizeof(masteraddr));
-    masteraddr.ai_family = AF_UNSPEC;
-    masteraddr.ai_socktype = SOCK_STREAM;
-    
-    int status = getaddrinfo(master_name, master_port, &masteraddr, &masteraddr_list);
-    ringmaster_sock = getRingMasterSocket(masteraddr_list->ai_protocol);
-    status = connect(ringmaster_sock, masteraddr_list->ai_addr, masteraddr_list->ai_addrlen);
-    errorListener("Error connecting to ringmaster", status);
-    neighbours->push_back(ringmaster_sock);
-    
-    //send port number to ringmaster 
-    const char * port = player_port.c_str();
-    std::cout << "port length: " << strlen(port) << std::endl;
-    send(ringmaster_sock, port, strlen(port), 0);
+    *client_fd = getClientSocket(hostaddr_list->ai_protocol);
+    status = connect(*client_fd, hostaddr_list->ai_addr, hostaddr_list->ai_addrlen);
+
+    errorListener("Error connecting to process", status);
+
 }
 
 /**
@@ -84,67 +131,155 @@ void connectToRingmaster(const char * master_name, const char * master_port) {
 void buildSelectLists() {
     FD_ZERO(&readfds);
     FD_ZERO(&writefds);
-    max_fd = neighbours->at(0);
-    FD_SET(max_fd, &readfds);
-    FD_SET(max_fd, &writefds);
-    for (int i = 1; i < neighbours->size(); i++) {
-        max_fd = std::max(max_fd, neighbours->at(i));
-        FD_SET(neighbours->at(i), &readfds);
-        FD_SET(neighbours->at(i), &writefds);
-    }
-}
-
-/**
- * Sets up socket connections for all player processes
-*/
-void connectToNeighbours() {
-    for (int i = 0; i < MAX_CONN; i++) {
-        int status = select(max_fd+1, &readfds, NULL, NULL, NULL); //listens for a connection; blocking call
-        errorListener("select socket connection", status);
-
-         //reading from the player socket means there's either:
-          //-a new connection request to it
-          //-incoming data is coming to it from a socket
-         if (FD_ISSET(player_sock, &readfds)) {
-            handleNewConnection(); 
-
-            char buffer[2000];
-            recv(curr_sockfd, buffer, 100, 0);
-            buffer[99] = 0;
-
-            std::cout << "Ringmaster received: " << buffer << " from Player with socket " << curr_sockfd << std::endl;
-         }
-         /* FD_ZERO(&readfds);
-         FD_SET(master_fd, &readfds); */
-         buildSelectLists();
-    }
-}
-
-void getNeighborInfoFromRingMaster() {
-    FD_ZERO(&readfds);
+    FD_SET(player_sock, &readfds);
     FD_SET(ringmaster_sock, &readfds);
-    max_fd = ringmaster_sock;
-
-    for (int i = 0; i < MAX_CONN; i++) {
-        int status = select(max_fd+1, &readfds, NULL, NULL, NULL);
-        errorListener("select socket connection", status);
-
-        if (FD_ISSET(ringmaster_sock, &readfds)) {
-            char buffer[200];
-            recv(ringmaster_sock, buffer, 100, 0);
-            buffer[48] = 0;
-
-            std::cout << "Player received: " << buffer << " from ringmaster\n";
-        }
+    max_fd = std::max(player_sock, ringmaster_sock);
+    for (int i = 0; i < neighbours_fds->size(); i++) {
+        int curr_fd = neighbours_fds->at(i);
+        
+        max_fd = std::max(max_fd, curr_fd);
+        FD_SET(curr_fd, &readfds);
+        FD_SET(curr_fd, &writefds);
     }
 }
 
 /*
- * Connect to neigbours
+ * Sets up socket connections with the right neighbour of the player
  */
-void listenToSockets() {
+void connectToNeighbours() {
+    //connect to right neighbour process
+    int right_sock;
 
+    connectToProcess(*(right_neighbor->getHost()), *(right_neighbor->getPort()), &right_sock);
+    neighbours_fds->push_back(right_sock);
+    right_neighbor->getSocket() = right_sock;
+
+    //accept connection from left neighbour
+    handleNewConnection();
+    
+    string message = "Player " + std::to_string(player_id) + " is ready to play";
+    const char * alert = message.c_str();
+    send(ringmaster_sock, alert, strlen(alert), 0);
 }
+
+/*
+ * - Attach player id
+ * - Decrement hops by 1
+ * - if hops == 0:
+ *      - send potato to ringmaster
+ *   else send potato to random neighbour
+ */
+void handlePotatoData(string data) {
+    char * input = strdup(data.c_str());
+    vector<string> potato_fields = parse(input, "&");
+
+    if (potato_fields.size() == 1) {
+        char * d = strdup(potato_fields.at(0).c_str());
+        vector<string> pot_data = parse(d, ":");
+        string trace;
+        if (pot_data.size() != 3) {
+            trace = std::to_string(player_id) + "&";
+        } else {
+            trace = pot_data.at(2) + "," + std::to_string(player_id) + "&";
+        }
+
+        int hops = stoi(pot_data.at(1)) - 1;
+        string update = std::to_string(player_id) + ":" + std::to_string(hops) + ":" + trace;
+
+        const char * potato = update.c_str();
+        if (hops == 0) {
+            std::cout << "I'm it\n";
+            send(ringmaster_sock, potato, strlen(potato), 0);
+        } else {
+            int index = rand() % MAX_CONN; // pick a random index
+            int fd = neighbours_fds->at(index);
+
+            if (fd == right_neighbor->getSocket()) {
+                std::cout << "Sending potato to " << right_neighbor->getPlayerId() << std::endl;
+            } else if (fd == left_neighbor->getSocket()) {
+                std::cout << "Sending potato to " << left_neighbor->getPlayerId() << std::endl;
+            }
+
+            send(fd, potato, strlen(potato), 0);
+            
+        }
+    }
+    
+}
+
+/*
+ * Handles init setup data from ringmaster
+*/
+void init(char * input) {
+
+    parseInitData(input);
+    std::cout << "Connected as player " 
+                        << std::to_string(player_id) 
+                        <<" out of " << std::to_string(num_players) << " total players\n";
+    
+}
+
+/*
+ * Processes data from the ringmaster
+ * - end game 
+ * - potato 
+ * - initial setup data
+ */
+void handleDataFromRingMaster() {
+
+    char buffer[2000];
+    ssize_t len = recv(ringmaster_sock, buffer, 1999, 0);
+    errorListener("Error receiving neighbour data", len);
+    buffer[len] = 0;
+
+    if (strlen(buffer) == 0) {
+        return;
+    }
+
+    string input = buffer;
+    if (input.find("&") == string::npos) { 
+        if (input.compare(END_GAME) == 0) {
+            isGameOver = true;
+        } else {
+            handlePotatoData(input);
+        }
+        
+    } else {
+        init(buffer);
+        connectToNeighbours();
+    }
+    
+}
+
+/*
+ * Processes data received from neighbour 
+ */
+void handleDataFromNeighbours(int neighbour_fd) {
+
+    char buffer[2000];
+    ssize_t len = recv(neighbour_fd, buffer, 1999, 0);
+    errorListener("Error receiving neighbour data", len);
+    buffer[len] = 0;
+
+    string input = buffer;
+
+    if (strchr(buffer, ':') != NULL) {
+        handlePotatoData(input);     
+    }
+}
+
+/*
+ * Connect to the ringmaster and send port number
+ */
+void connectToRingmaster(const char * host_name, const char * host_port) {
+    //connect to ringmaster process
+    connectToProcess(host_name, host_port, &ringmaster_sock);
+
+    //send port number to ringmaster 
+    const char * port = std::to_string(player_port).c_str();
+    send(ringmaster_sock, port, strlen(port), 0);
+}
+
 
 
 int main(int argc, char ** argv) {
@@ -159,49 +294,47 @@ int main(int argc, char ** argv) {
     struct addrinfo playeraddr;
     struct addrinfo *playeraddr_list;
     vector<Player> neigbours;
-    int max_fd;
 
     //1.Open a socket to listen for incoming neigbour connections:
         //-resolving the domain name with the port to get an IP address to bind to the socket
         //-creating a socket with the address info and binding the address to the socket
-    memset(&playeraddr, 0, sizeof(playeraddr));
-    setAddressOptions(&playeraddr);
-    setPlayerPort();
-
-    std::cout << "player port: " << player_port.c_str() << std::endl;
-    status = getaddrinfo(hostname, player_port.c_str(), &playeraddr, &playeraddr_list);
-    errorListener("getaddrinfo", status);
-
-    player_sock = socket(playeraddr_list->ai_family, 
-                    playeraddr_list->ai_socktype, 
-                    playeraddr_list->ai_protocol);
-    errorListener("create socket", player_sock);
-    
-    int reuse = 1;
-    status = setsockopt(player_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(int));
-    errorListener("set socket options", status);
-
-    status = bind(player_sock, playeraddr_list->ai_addr, playeraddr_list->ai_addrlen);   //player binds to any address
-    perror("Error binding to player socket\n");
-    errorListener("bind to socket", status);
+    player_sock = setupServer(
+        &playeraddr,
+        &playeraddr_list,
+        hostname,
+        ""
+    );
+    player_port = getPort(player_sock);
+    status = listen(player_sock, 100);
 
     //2.Connect listener to ringmaster
     connectToRingmaster(master_name, port);
-
-    //3. Listen to ringmaster connection to get neighbor info: need ringmaster socket descriptor?
-        //- get player address and port from ringmaster
-        //- connect() to neigbors with player addresses
-        //- use select() to listen for the potato object
-    status = listen(player_sock, MAX_CONN);
-    perror("listen failed");
-    buildSelectLists();
-    getNeighborInfoFromRingMaster();
+    errorListener("Error listening to connections", status);
 
     while(true) {
+        if (isGameOver) {
+            break;
+        }
+        buildSelectLists();
 
-        listenToSockets();
+        status = select(max_fd + 1, &readfds, NULL, NULL, NULL);
+        errorListener("Error listening to neighbours", status);
+
+        if (FD_ISSET(ringmaster_sock, &readfds)) {
+            handleDataFromRingMaster();
+        }
+
+        for (int i = 0; i < neighbours_fds->size(); i++) {
+            int fd = neighbours_fds->at(i);
+            if (FD_ISSET(fd, &readfds)) {
+                handleDataFromNeighbours(fd);
+            }
+        }
+
     }
-    
+
+    freeaddrinfo(playeraddr_list);
+    close(player_sock);   
     return EXIT_SUCCESS;
     
 }
